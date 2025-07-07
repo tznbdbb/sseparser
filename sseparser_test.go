@@ -8,9 +8,9 @@ import (
 	"io"
 	"testing"
 
-	"github.com/jclem/sseparser"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tznbdbb/sseparser"
 )
 
 func TestParseField(t *testing.T) {

@@ -1,4 +1,4 @@
-module github.com/jclem/sseparser
+module github.com/tznbdbb/sseparser
 
 go 1.22
 
