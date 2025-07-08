@@ -503,3 +503,181 @@ func WithReadSize(size int) Opt {
 		s.rs = size
 	}
 }
+
+// ManualParser is a manually controlled data buffer for accumulating and parsing
+// Server-Sent Events (SSE). It supports two modes for memory management.
+type ManualParser struct {
+	buf          []byte
+	parsedOffset int
+	capacity     int
+	lastParseEnd int
+	resizeFactor float64
+}
+
+// Option configures a ManualParser.
+type Option func(*ManualParser)
+
+// WithCapacity sets the initial buffer capacity.
+func WithCapacity(capacity int) Option {
+	return func(m *ManualParser) {
+		if capacity > 0 {
+			m.buf = make([]byte, 0, capacity)
+			m.capacity = capacity
+		}
+	}
+}
+
+// WithResizeFactor sets the factor used to determine when to shrink the buffer.
+// The buffer shrinks if cap(buf) > len(buf) * factor. Size To len(buf) * factor
+// factor > 1.
+func WithResizeFactor(factor float64) Option {
+	return func(m *ManualParser) {
+		if factor > 1 {
+			m.resizeFactor = factor
+		}
+	}
+}
+
+// NewManualParser creates a new ManualParser with optional configuration.
+func NewManualParser(opts ...Option) *ManualParser {
+	defaultCapacity := 8192
+	m := &ManualParser{
+		buf:          make([]byte, 0, defaultCapacity),
+		parsedOffset: 0,
+		capacity:     defaultCapacity,
+		resizeFactor: 1.5,
+	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	return m
+}
+
+// Append adds data to the internal buffer.
+func (m *ManualParser) Append(data []byte) {
+	m.buf = append(m.buf, data...)
+}
+
+// TryParse attempts to parse a single Event from the buffer without consuming data.
+// This method can be called multiple times and will return the same event (including
+// the first Parse()) until Consume() is called.
+//
+// It returns the parsed Event and an error if one occurred.
+// If the buffer does not contain a complete event, it returns (nil, nil).
+func (m *ManualParser) TryParse() (Event, error) {
+	if len(m.buf) <= m.parsedOffset {
+		return nil, nil
+	}
+
+	scanSlice := m.buf[m.parsedOffset:]
+	if len(scanSlice) == 0 {
+		return nil, nil
+	}
+
+	scanner := parsec.NewScanner(scanSlice)
+	node, scanner := eventParser(scanner)
+
+	if event, ok := node.(Event); ok {
+		m.lastParseEnd = m.parsedOffset + scanner.GetCursor()
+		return event, nil
+	}
+
+	cursor := scanner.GetCursor()
+	if cursor == 0 {
+		return nil, nil
+	}
+
+	// Malformed data if parser consumed bytes but failed to produce an event
+	errorPos := cursor + m.parsedOffset
+	if errorPos < len(m.buf) {
+		remainder := m.buf[errorPos:]
+		return nil, fmt.Errorf("malformed SSE data at position %d: %q", errorPos, remainder)
+	}
+
+	return nil, nil
+}
+
+// Consume manually consumes the last parsed event from TryParse().
+// This method must be called after TryParse() to consume the parsed event.
+// Returns the number of bytes consumed, or 0 if no event was previously parsed.
+func (m *ManualParser) Consume() int {
+	if m.lastParseEnd <= m.parsedOffset {
+		return 0
+	}
+
+	consumed := m.lastParseEnd - m.parsedOffset
+	m.parsedOffset = m.lastParseEnd
+	return consumed
+}
+
+// Parse attempts to parse a single Event from the buffer and consumes the data immediately.
+// This is equivalent to calling TryParse() followed by Consume().
+//
+// It returns the parsed Event and an error if one occurred.
+// If the buffer does not contain a complete event, it returns (nil, nil).
+func (m *ManualParser) Parse() (Event, error) {
+	event, err := m.TryParse()
+	if err != nil {
+		return nil, err
+	}
+
+	if event != nil {
+		m.Consume()
+	}
+
+	return event, nil
+}
+
+// PruneParsedData discards all parsed event data by moving unparsed data to the
+func (m *ManualParser) PruneParsedData() {
+	if m.parsedOffset == 0 {
+		return
+	}
+
+	unparsedLen := len(m.buf) - m.parsedOffset
+	copy(m.buf, m.buf[m.parsedOffset:])
+	m.buf = m.buf[:unparsedLen]
+	m.parsedOffset = 0
+	m.lastParseEnd = 0
+
+	m.shrinkIfNeeded()
+}
+
+// shrinkIfNeeded checks if the buffer's capacity should be reduced and, if so,
+// reallocates the buffer to a smaller size.
+func (m *ManualParser) shrinkIfNeeded() {
+	currentCap := cap(m.buf)
+	currentLen := len(m.buf)
+
+	targetShrinkCapacity := int(float64(currentLen) * m.resizeFactor)
+	if currentCap > m.capacity && cap(m.buf) > targetShrinkCapacity {
+		newBuf := make([]byte, currentLen, targetShrinkCapacity)
+		copy(newBuf, m.buf)
+		m.buf = newBuf
+	}
+}
+
+// ParsedBytes returns all data that has been successfully parsed but not yet
+// compacted. This method is only useful in manual compaction mode
+// (i.e., when WithAutoCompaction(false) is set).
+func (m *ManualParser) ParsedBytes() []byte {
+	if m.parsedOffset == 0 {
+		return nil
+	}
+	return m.buf[:m.parsedOffset]
+}
+
+// UnparsedBytes returns the portion of the buffer that has not yet been parsed.
+func (m *ManualParser) UnparsedBytes() []byte {
+	if len(m.buf) <= m.parsedOffset {
+		return nil
+	}
+	return m.buf[m.parsedOffset:]
+}
+
+// AllBytes returns the all the internal buffer.
+func (m *ManualParser) AllBytes() []byte {
+	return m.buf
+}
