@@ -21,7 +21,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/jclem/sseparser"
+	"github.com/tznbdbb/sseparser"
 )
 
 func main() {

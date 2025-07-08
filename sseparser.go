@@ -503,3 +503,161 @@ func WithReadSize(size int) Opt {
 		s.rs = size
 	}
 }
+
+// ManualParser is a manually controlled data buffer for accumulating and parsing
+// Server-Sent Events (SSE). It supports two modes for memory management.
+type ManualParser struct {
+	buf          []byte
+	parsedOffset int
+	capacity     int
+	resizeFactor float64
+}
+
+// Option configures a ManualParser.
+type Option func(*ManualParser)
+
+// WithCapacity sets the initial buffer capacity.
+func WithCapacity(capacity int) Option {
+	return func(m *ManualParser) {
+		if capacity > 0 {
+			m.buf = make([]byte, 0, capacity)
+			m.capacity = capacity
+		}
+	}
+}
+
+// WithResizeFactor sets the factor used to determine when to shrink the buffer.
+// The buffer shrinks if cap(buf) > len(buf) * factor. Size To len(buf) * factor
+// factor > 1.
+func WithResizeFactor(factor float64) Option {
+	return func(m *ManualParser) {
+		if factor > 1 {
+			m.resizeFactor = factor
+		}
+	}
+}
+
+// NewManualParser creates a new ManualParser with optional configuration.
+func NewManualParser(opts ...Option) *ManualParser {
+	defaultCapacity := 8192
+	m := &ManualParser{
+		buf:          make([]byte, 0, defaultCapacity),
+		parsedOffset: 0,
+		capacity:     defaultCapacity,
+		resizeFactor: 1.5,
+	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	return m
+}
+
+// Append adds data to the internal buffer.
+func (m *ManualParser) Append(data []byte) {
+	m.buf = append(m.buf, data...)
+}
+
+// TryParse attempts to parse a single Event from the buffer. This is a zero-copy
+// operation that does not return the raw event bytes. Its behavior depends on the
+// compaction mode.
+//
+// It returns the parsed Event, the number of bytes consumed, and an error if one occurred.
+// If the buffer does not contain a complete event, it returns (nil, 0, nil).
+func (m *ManualParser) TryParse() (Event, error) {
+	var scanSlice []byte
+	if len(m.buf) <= m.parsedOffset {
+		return nil, nil
+	}
+	scanSlice = m.buf[m.parsedOffset:]
+	if len(scanSlice) == 0 {
+		return nil, nil
+	}
+
+	scanner := parsec.NewScanner(scanSlice)
+	node, scanner := eventParser(scanner)
+
+	if event, ok := node.(Event); ok {
+		m.parsedOffset += scanner.GetCursor()
+		return event, nil
+	}
+
+	cursor := scanner.GetCursor()
+	if cursor == 0 {
+		return nil, nil
+	}
+
+	// Malformed data if parser consumed bytes but failed to produce an event
+	errorPos := cursor
+	errorPos += m.parsedOffset
+	if errorPos < len(m.buf) {
+		remainder := m.buf[errorPos:]
+		return nil, fmt.Errorf("malformed SSE data at position %d: %q", errorPos, remainder)
+	}
+
+	return nil, nil
+}
+
+// ParsedBytes returns all data that has been successfully parsed but not yet
+// compacted. This method is only useful in manual compaction mode
+// (i.e., when WithAutoCompaction(false) is set).
+func (m *ManualParser) ParsedBytes() []byte {
+	if m.parsedOffset == 0 {
+		return nil
+	}
+	return m.buf[:m.parsedOffset]
+}
+
+// Compact discards all parsed event data by moving unparsed data to the
+// beginning of the buffer. This method is intended for use in manual
+// compaction mode and is a no-op in auto-compaction mode.
+func (m *ManualParser) Compact() {
+	if m.parsedOffset == 0 {
+		return
+	}
+
+	unparsedLen := len(m.buf) - m.parsedOffset
+	copy(m.buf, m.buf[m.parsedOffset:])
+	m.buf = m.buf[:unparsedLen]
+	m.parsedOffset = 0
+
+	m.shrinkIfNeeded()
+}
+
+// shrinkIfNeeded checks if the buffer's capacity should be reduced and, if so,
+// reallocates the buffer to a smaller size.
+func (m *ManualParser) shrinkIfNeeded() {
+	currentCap := cap(m.buf)
+	currentLen := len(m.buf)
+
+	targetShrinkCapacity := int(float64(currentLen) * m.resizeFactor)
+	if currentCap > m.capacity && cap(m.buf) > targetShrinkCapacity {
+		newBuf := make([]byte, currentLen, targetShrinkCapacity)
+		copy(newBuf, m.buf)
+		m.buf = newBuf
+	}
+}
+
+// UnparsedBytes returns the portion of the buffer that has not yet been parsed.
+func (m *ManualParser) UnparsedBytes() []byte {
+	if len(m.buf) <= m.parsedOffset {
+		return nil
+	}
+	return m.buf[m.parsedOffset:]
+}
+
+// Len returns the current total number of bytes in the buffer.
+func (m *ManualParser) Len() int {
+	return len(m.buf)
+}
+
+// Cap returns the current capacity of the internal buffer.
+func (m *ManualParser) Cap() int {
+	return cap(m.buf)
+}
+
+// String returns the entire buffer content as a string, for debugging.
+func (m *ManualParser) String() string {
+	return string(m.buf)
+}
