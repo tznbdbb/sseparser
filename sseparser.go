@@ -3,7 +3,8 @@
 // https://html.spec.whatwg.org/multipage/server-sent-events.html
 //
 // The primary means of utilizing this package is through the [StreamScanner]
-// type, which scans an [io.Reader] for SSEs.
+// type, which scans an [io.Reader] for SSEs. For more advanced use cases
+// involving manual buffer control, the [ParseRawEvent] function is provided.
 package sseparser
 
 import (
@@ -273,7 +274,8 @@ func unmarshalEvent(e Event, v any) error { //nolint:cyclop,funlen,gocognit // E
 	return nil
 }
 
-// ParseEvent parses an input into an Event.
+// ParseEvent parses an input into an Event, expecting the input to contain
+// exactly one event.
 func ParseEvent(input []byte) (Event, error) {
 	scanner := parsec.NewScanner(input)
 	node, scanner := eventParser(scanner)
@@ -288,6 +290,41 @@ func ParseEvent(input []byte) (Event, error) {
 	}
 
 	return nil, fmt.Errorf("failed to parse event: unexpected type: %T", node)
+}
+
+// ParseRawEvent attempts to parse a single event from the beginning of a byte slice.
+// It is designed for use in custom buffer-management scenarios where the input slice
+// may contain more than one event or an incomplete event.
+//
+// It returns:
+// - The parsed Event.
+// - The number of bytes consumed from the input slice to form this event.
+// - An error if the data is malformed.
+//
+// If the input does not contain a complete event, it returns (nil, 0, nil).
+// The caller can then append more data to their buffer and try again.
+func ParseRawEvent(input []byte) (Event, int, error) {
+	if len(input) == 0 {
+		return nil, 0, nil
+	}
+
+	scanner := parsec.NewScanner(input)
+	node, scanner := eventParser(scanner)
+
+	if event, ok := node.(Event); ok {
+		bytesConsumed := scanner.GetCursor()
+		return event, bytesConsumed, nil
+	}
+
+	bytesConsumed := scanner.GetCursor()
+	// If the parser consumed bytes but did not produce a valid event,
+	// it indicates a malformed structure.
+	if bytesConsumed > 0 {
+		return nil, bytesConsumed, fmt.Errorf("malformed SSE data at position %d", bytesConsumed)
+	}
+
+	// If no bytes were consumed, it implies not enough data for a full event.
+	return nil, 0, nil
 }
 
 var eventParser = parsec.And(toEvent,
@@ -444,14 +481,20 @@ func (s *StreamScanner) Next() (Event, []byte, error) {
 			eof = ErrStreamEOF
 		}
 
-		scanner := parsec.NewScanner(s.buf)
-		node, scanner := eventParser(scanner)
+		event, n, err := ParseRawEvent(s.buf)
+		if err != nil {
+			// Forward the malformed data error, but we need to decide how to handle the buffer.
+			// For now, we'll return the error and the full buffer to let the user decide.
+			return nil, s.buf, err
+		}
 
-		if node, ok := node.(Event); ok {
-			offset := scanner.GetCursor()
-			s.buf = s.buf[offset:]
-			return node, s.buf, nil
-		} else if eof != nil {
+		if event != nil {
+			s.buf = s.buf[n:]
+			return event, s.buf, nil
+		}
+
+		// If event is nil and err is nil, it means we need more data.
+		if eof != nil {
 			return nil, s.buf, eof
 		}
 	}
