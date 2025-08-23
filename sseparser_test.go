@@ -579,3 +579,67 @@ func (m *meta) UnmarshalSSEValue(v string) error {
 
 	return nil
 }
+
+// 在文件包级别添加（放在 imports 之后，tests 之前）
+type chunkReader struct {
+	chunks [][]byte
+	i      int
+}
+
+func (r *chunkReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[r.i])
+	r.i++
+	return n, nil
+}
+
+// ------------ 测试用例 ------------
+
+func TestParseRawEvent_CRLFSplit(t *testing.T) {
+	t.Parallel()
+
+	full := []byte("data:\r\n\r\n")
+	event, n, err := sseparser.ParseRawEvent(full)
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, len(full), n)
+
+	part1 := []byte("data:\r\n\r")
+	event1, n1, err1 := sseparser.ParseRawEvent(part1)
+	require.NoError(t, err1)
+	assert.Nil(t, event1)
+	assert.Equal(t, 0, n1)
+
+	part2 := []byte("\n")
+	combined := append([]byte(nil), part1...)
+	combined = append(combined, part2...)
+	event2, n2, err2 := sseparser.ParseRawEvent(combined)
+	require.NoError(t, err2)
+	require.NotNil(t, event2)
+	assert.Equal(t, len(combined), n2)
+}
+
+func TestStreamScanner_CRLFSplit(t *testing.T) {
+	t.Parallel()
+
+	reader := &chunkReader{
+		chunks: [][]byte{
+			[]byte("data:\r\n\r"),
+			[]byte("\n"),
+		},
+	}
+
+	scanner := sseparser.NewStreamScanner(reader)
+
+	e, left, err := scanner.Next()
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	assert.Equal(t, 0, len(left))
+
+	e2, left2, err2 := scanner.Next()
+	assert.Nil(t, e2)
+	require.ErrorIs(t, err2, sseparser.ErrStreamEOF)
+	assert.Equal(t, 0, len(left2))
+}

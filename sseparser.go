@@ -313,6 +313,16 @@ func ParseRawEvent(input []byte) (Event, int, error) {
 
 	if event, ok := node.(Event); ok {
 		bytesConsumed := scanner.GetCursor()
+
+		// --- NEW: avoid treating a trailing lone CR at buffer end as a complete EOL
+		// If the last consumed byte is CR and we consumed up to the end of the input,
+		// that CR might be the first half of a CRLF split across reads.
+		// In that case return (nil,0,nil) to indicate "need more data".
+		if bytesConsumed > 0 && input[bytesConsumed-1] == '\r' && bytesConsumed == len(input) {
+			// Treat as incomplete — wait for potential following '\n'
+			return nil, 0, nil
+		}
+
 		return event, bytesConsumed, nil
 	}
 
